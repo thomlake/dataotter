@@ -1,8 +1,6 @@
 from dataclasses import dataclass
 from typing import Literal
 
-import pandas as pd
-
 STATUS_SUCCESS = "success"
 STATUS_ERROR = "error"
 STATUS_REUSED = "reused"
@@ -41,8 +39,8 @@ class RowEvent:
 
 @dataclass(frozen=True)
 class MapResult:
-    output: pd.DataFrame
-    errors: pd.DataFrame
+    output: list[dict[str, object]]
+    errors: list[dict[str, object]]
     stats: MapStats
     run_id: str
-    map_id: str
+    name: str

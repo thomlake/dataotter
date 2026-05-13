@@ -7,8 +7,6 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-import pandas as pd
-
 HASH_PREFIX = "sha256:"
 
 
@@ -20,14 +18,8 @@ def normalize_value(value: Any) -> Any:
     if value is None:
         return None
 
-    if value is pd.NA:
-        return None
-
     if isinstance(value, float) and math.isnan(value):
         return None
-
-    if isinstance(value, pd.Timestamp):
-        return value.isoformat()
 
     if isinstance(value, datetime | date):
         return value.isoformat()
@@ -41,7 +33,10 @@ def normalize_value(value: Any) -> Any:
     if isinstance(value, Mapping):
         return {
             str(key): normalize_value(item)
-            for key, item in sorted(value.items(), key=lambda pair: str(pair[0]))
+            for key, item in sorted(
+                value.items(),
+                key=lambda pair: str(pair[0]),
+            )
         }
 
     if isinstance(value, tuple):
@@ -50,7 +45,10 @@ def normalize_value(value: Any) -> Any:
     if isinstance(value, list):
         return [normalize_value(item) for item in value]
 
-    if isinstance(value, Sequence) and not isinstance(value, str | bytes | bytearray):
+    if isinstance(value, Sequence) and not isinstance(
+        value,
+        str | bytes | bytearray,
+    ):
         return [normalize_value(item) for item in value]
 
     if hasattr(value, "item"):
@@ -64,12 +62,6 @@ def normalize_value(value: Any) -> Any:
 
     if isinstance(value, float):
         return value
-
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
 
     return value
 
@@ -88,9 +80,3 @@ def canonical_json(value: Any) -> str:
 def stable_hash(value: Any) -> str:
     payload = canonical_json(value).encode("utf-8")
     return f"{HASH_PREFIX}{hashlib.sha256(payload).hexdigest()}"
-
-
-def short_hash(value: str, *, length: int = 12) -> str:
-    if value.startswith(HASH_PREFIX):
-        value = value.removeprefix(HASH_PREFIX)
-    return value[:length]

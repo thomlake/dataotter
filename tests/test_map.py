@@ -1,7 +1,6 @@
 import asyncio
 import json
 
-import pandas as pd
 import pytest
 
 import dataotter
@@ -10,39 +9,36 @@ import dataotter
 async def test_successful_map_and_cache_reuse(tmp_path):
     calls = 0
 
-    async def classify(text: str) -> dict[str, object]:
+    async def classify(id: str, body: str) -> dict[str, object]:
         nonlocal calls
         calls += 1
-        return {"label": text.upper()}
+        return {"classification_label": body.upper()}
 
-    df = pd.DataFrame({"id": ["1", "2"], "body": ["a", "b"]})
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
+    data = [{"id": "1", "body": "a"}, {"id": "2", "body": "b"}]
+    store = dataotter.JsonlStore(tmp_path)
 
     result = await dataotter.map(
-        data=df,
+        data=data,
         row_id="id",
-        step_name="classify",
+        name="classify",
         fn=classify,
-        inputs={"body": "text"},
-        outputs={"label": "classification_label"},
-        engine=engine,
+        store=store,
     )
 
     assert calls == 2
-    assert result.output.to_dict(orient="records") == [
+    assert result.name == "classify"
+    assert result.output == [
         {"id": "1", "classification_label": "A"},
         {"id": "2", "classification_label": "B"},
     ]
-    assert result.errors.empty
+    assert result.errors == []
 
     second = await dataotter.map(
-        data=df,
+        data=data,
         row_id="id",
-        step_name="classify",
+        name="classify",
         fn=classify,
-        inputs={"body": "text"},
-        outputs={"label": "classification_label"},
-        engine=engine,
+        store=store,
     )
 
     assert calls == 2
@@ -50,274 +46,196 @@ async def test_successful_map_and_cache_reuse(tmp_path):
     assert second.stats.attempted_rows == 0
 
 
+async def test_config_mismatch_raises_before_running_work(tmp_path):
+    calls = 0
+
+    async def fn(id: str, text: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"value": text}
+
+    store = dataotter.JsonlStore(tmp_path)
+    data = [{"id": "1", "text": "x"}]
+
+    await dataotter.map(
+        data=data,
+        row_id="id",
+        name="config",
+        fn=fn,
+        config={"prompt": "a"},
+        store=store,
+    )
+
+    with pytest.raises(dataotter.ConfigMismatchError):
+        await dataotter.map(
+            data=data,
+            row_id="id",
+            name="config",
+            fn=fn,
+            config={"prompt": "b"},
+            store=store,
+        )
+
+    assert calls == 1
+
+
+async def test_cache_mismatch_raises_before_running_work(tmp_path):
+    calls = 0
+
+    async def echo(id: str, text: str) -> dict[str, object]:
+        nonlocal calls
+        calls += 1
+        return {"value": text}
+
+    store = dataotter.JsonlStore(tmp_path)
+
+    await dataotter.map(
+        data=[{"id": "1", "text": "old"}],
+        row_id="id",
+        name="echo",
+        fn=echo,
+        store=store,
+    )
+
+    with pytest.raises(dataotter.CacheMismatchError) as exc_info:
+        await dataotter.map(
+            data=[{"id": "1", "text": "new"}],
+            row_id="id",
+            name="echo",
+            fn=echo,
+            store=store,
+        )
+
+    assert calls == 1
+    assert (
+        exc_info.value.mismatches[0]["mismatch_type"]
+        == "input_value_changed"
+    )
+
+
 async def test_failed_rows_are_retried_and_success_supersedes_error(tmp_path):
     seen: dict[int, int] = {}
 
-    async def sometimes_fails(text: str) -> dict[str, object]:
+    async def sometimes_fails(id: str, text: str) -> dict[str, object]:
         row_number = int(text)
         seen[row_number] = seen.get(row_number, 0) + 1
         if row_number == 1 and seen[row_number] == 1:
             raise RuntimeError("temporary")
         return {"value": row_number * 10}
 
-    df = pd.DataFrame({"id": ["1", "2"], "text": ["1", "2"]})
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
+    data = [{"id": "1", "text": "1"}, {"id": "2", "text": "2"}]
+    store = dataotter.JsonlStore(tmp_path)
 
     first = await dataotter.map(
-        data=df,
+        data=data,
         row_id="id",
-        step_name="numbers",
+        name="numbers",
         fn=sometimes_fails,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        store=store,
         errors="return",
     )
 
     assert first.stats.failed_rows == 1
-    assert first.errors["row_id"].tolist() == ["1"]
+    assert [error["row_id"] for error in first.errors] == ["1"]
 
     second = await dataotter.map(
-        data=df,
+        data=data,
         row_id="id",
-        step_name="numbers",
+        name="numbers",
         fn=sometimes_fails,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        store=store,
     )
 
-    assert second.errors.empty
-    assert second.output.sort_values("id").to_dict(orient="records") == [
+    assert second.errors == []
+    assert sorted(second.output, key=lambda row: row["id"]) == [
         {"id": "1", "value": 10},
         {"id": "2", "value": 20},
     ]
 
 
-async def test_cache_mismatch_raises_before_running_work(tmp_path):
+async def test_full_record_hash_controls_cache_mismatch(tmp_path):
     calls = 0
 
-    async def echo(text: str) -> dict[str, object]:
+    async def fn(**record: object) -> dict[str, object]:
         nonlocal calls
         calls += 1
-        return {"value": text}
+        return {"value": record["text"]}
 
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
-    df = pd.DataFrame({"id": ["1"], "text": ["old"]})
-    changed = pd.DataFrame({"id": ["1"], "text": ["new"]})
-
+    store = dataotter.JsonlStore(tmp_path)
     await dataotter.map(
-        data=df,
+        data=[{"id": "1", "text": "x", "ignored": "a"}],
         row_id="id",
-        step_name="echo",
-        fn=echo,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        name="full_record",
+        fn=fn,
+        store=store,
     )
 
-    with pytest.raises(dataotter.CacheMismatchError) as exc_info:
+    with pytest.raises(dataotter.CacheMismatchError):
         await dataotter.map(
-            data=changed,
+            data=[{"id": "1", "text": "x", "ignored": "b"}],
             row_id="id",
-            step_name="echo",
-            fn=echo,
-            inputs=["text"],
-            outputs=["value"],
-            engine=engine,
+            name="full_record",
+            fn=fn,
+            store=store,
         )
 
     assert calls == 1
-    assert exc_info.value.mismatches["mismatch_type"].tolist() == ["input_value_changed"]
 
 
-async def test_kwargs_normalization_controls_cache_mismatch(tmp_path):
-    calls = 0
-
-    async def echo(value: object) -> dict[str, object]:
-        nonlocal calls
-        calls += 1
-        return {"value": value}
-
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
-    await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "value": [pd.NA]}),
-        row_id="id",
-        step_name="normalize_kwargs",
-        fn=echo,
-        inputs=["value"],
-        outputs=["value"],
-        engine=engine,
-    )
-    reused = await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "value": [None]}),
-        row_id="id",
-        step_name="normalize_kwargs",
-        fn=echo,
-        inputs=["value"],
-        outputs=["value"],
-        engine=engine,
-    )
-
-    assert calls == 1
-    assert reused.stats.reused_rows == 1
-
-
-async def test_config_and_output_bindings_change_map_id(tmp_path):
-    async def fn(text: str) -> dict[str, object]:
-        return {"label": text}
-
-    df = pd.DataFrame({"id": ["1"], "text": ["x"]})
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
-
-    first = await dataotter.map(
-        data=df,
-        row_id="id",
-        step_name="experiment",
-        fn=fn,
-        inputs=["text"],
-        outputs={"label": "label_a"},
-        config={"prompt": "a"},
-        engine=engine,
-    )
-    second = await dataotter.map(
-        data=df,
-        row_id="id",
-        step_name="experiment",
-        fn=fn,
-        inputs=["text"],
-        outputs={"label": "label_b"},
-        config={"prompt": "b"},
-        engine=engine,
-    )
-
-    assert first.map_id != second.map_id
-    assert engine.list_maps(step_name="experiment").shape[0] == 2
-
-
-async def test_source_column_and_row_id_column_renames_reuse_cache(tmp_path):
-    calls = 0
-
-    async def fn(text: str) -> dict[str, object]:
-        nonlocal calls
-        calls += 1
-        return {"value": text.upper()}
-
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
-    first = await dataotter.map(
-        data=pd.DataFrame({"doc_id": ["1"], "raw_text": ["hello"]}),
-        row_id="doc_id",
-        step_name="rename_safe",
-        fn=fn,
-        inputs={"raw_text": "text"},
-        outputs=["value"],
-        engine=engine,
-    )
-    second = await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "renamed_text": ["hello"]}),
-        row_id="id",
-        step_name="rename_safe",
-        fn=fn,
-        inputs={"renamed_text": "text"},
-        outputs=["value"],
-        engine=engine,
-    )
-
-    assert calls == 1
-    assert first.map_id == second.map_id
-    assert second.stats.reused_rows == 1
-    assert second.output.to_dict(orient="records") == [{"id": "1", "value": "HELLO"}]
-
-
-async def test_changing_function_argument_name_creates_new_map_id(tmp_path):
-    async def fn(**kwargs: object) -> dict[str, object]:
-        return {"value": next(iter(kwargs.values()))}
-
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
-    first = await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "text": ["hello"]}),
-        row_id="id",
-        step_name="arg_identity",
-        fn=fn,
-        inputs={"text": "text"},
-        outputs=["value"],
-        engine=engine,
-    )
-    second = await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "text": ["hello"]}),
-        row_id="id",
-        step_name="arg_identity",
-        fn=fn,
-        inputs={"text": "renamed_text"},
-        outputs=["value"],
-        engine=engine,
-    )
-
-    assert first.map_id != second.map_id
-    assert second.stats.attempted_rows == 1
-
-
-async def test_engine_normalizes_config_for_map_id_and_manifest(tmp_path):
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
-    config = {"nested": {"value": pd.NA}, "items": (1, 2)}
-
-    map_id = engine.derive_map_id(
-        step_name="config",
-        version="1",
-        input_args=["text"],
-        outputs={"value": "value"},
-        config=config,
-    )
-    manifest = await engine.store.ensure_map(
-        map_id=map_id,
-        step_name="config",
-        version="1",
+async def test_config_is_normalized_for_manifest(tmp_path):
+    store = dataotter.JsonlStore(tmp_path)
+    manifest = await store.ensure_map(
+        name="config",
         row_id_column="id",
-        inputs={"text": "text"},
-        outputs={"value": "value"},
-        config=config,
+        config={"items": (1, 2), "nested": {"value": None}},
     )
 
     assert manifest["config"] == {"items": [1, 2], "nested": {"value": None}}
-    assert manifest["config_hash"] == engine.get_map(map_id)["config_hash"]
+    assert store.get_map("config")["config_hash"] == manifest["config_hash"]
 
 
-async def test_engine_accepts_swappable_store(tmp_path):
-    async def fn(text: str) -> dict[str, object]:
+async def test_map_accepts_swappable_store_and_lists_maps(tmp_path):
+    async def fn(id: str, text: str) -> dict[str, object]:
         return {"value": text}
 
     store = dataotter.JsonlStore(tmp_path)
-    engine = dataotter.Engine(store=store)
-    result = await engine.map(
-        data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+    result = await dataotter.map(
+        data=[{"id": "1", "text": "a"}],
         row_id="id",
-        step_name="store_injection",
+        name="store_injection",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
+        store=store,
     )
 
-    assert result.output.to_dict(orient="records") == [{"id": "1", "value": "a"}]
-    assert engine.list_maps(step_name="store_injection").shape[0] == 1
+    assert result.output == [{"id": "1", "value": "a"}]
+    assert (
+        store.list_maps(name="store_injection")[0]["name"]
+        == "store_injection"
+    )
+
+
+async def test_map_uses_default_jsonl_store(monkeypatch, tmp_path):
+    async def fn(id: str, text: str) -> dict[str, object]:
+        return {"value": text}
+
+    monkeypatch.chdir(tmp_path)
+
+    result = await dataotter.map(
+        data=[{"id": "1", "text": "a"}],
+        row_id="id",
+        name="default_store",
+        fn=fn,
+    )
+
+    assert result.output == [{"id": "1", "value": "a"}]
+    assert (tmp_path / ".dataotter" / "maps" / "default_store").exists()
 
 
 async def test_jsonl_store_run_rejects_append_after_finish(tmp_path):
     store = dataotter.JsonlStore(tmp_path)
-    engine = dataotter.Engine(store=store)
-    map_id = engine.derive_map_id(
-        step_name="store_run",
-        version="1",
-        input_args=["text"],
-        outputs={"value": "value"},
-        config={},
-    )
     store_run, _ = await store.begin_run(
-        map_id=map_id,
-        step_name="store_run",
-        version="1",
+        name="store_run",
         row_id_column="id",
-        inputs={"text": "text"},
-        outputs={"value": "value"},
         config={},
     )
 
@@ -328,20 +246,18 @@ async def test_jsonl_store_run_rejects_append_after_finish(tmp_path):
 
 
 async def test_max_failures_allows_intermittent_failures(tmp_path):
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         value = int(text)
         if value in {0, 2}:
             raise RuntimeError(f"bad {value}")
         return {"value": value}
 
     result = await dataotter.map(
-        data=pd.DataFrame({"id": [str(i) for i in range(5)], "text": [str(i) for i in range(5)]}),
+        data=[{"id": str(i), "text": str(i)} for i in range(5)],
         row_id="id",
-        step_name="intermittent",
+        name="intermittent",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=dataotter.Engine(store=dataotter.JsonlStore(tmp_path)),
+        store=dataotter.JsonlStore(tmp_path),
         concurrency=1,
         errors="return",
         max_failures=3,
@@ -355,30 +271,26 @@ async def test_max_failures_allows_intermittent_failures(tmp_path):
 async def test_on_row_complete_receives_attempted_and_reused_events(tmp_path):
     events: list[dataotter.RowEvent] = []
 
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         return {"value": text}
 
-    df = pd.DataFrame({"id": ["1"], "text": ["a"]})
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
+    data = [{"id": "1", "text": "a"}]
+    store = dataotter.JsonlStore(tmp_path)
 
     first = await dataotter.map(
-        data=df,
+        data=data,
         row_id="id",
-        step_name="events",
+        name="events",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        store=store,
         on_row_complete=events.append,
     )
     await dataotter.map(
-        data=df,
+        data=data,
         row_id="id",
-        step_name="events",
+        name="events",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        store=store,
         on_row_complete=events.append,
     )
 
@@ -392,7 +304,7 @@ async def test_on_row_complete_receives_attempted_and_reused_events(tmp_path):
 async def test_on_row_complete_accepts_async_callback(tmp_path):
     events: list[tuple[str, str]] = []
 
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         if text == "bad":
             raise RuntimeError("bad row")
         return {"value": text}
@@ -402,13 +314,11 @@ async def test_on_row_complete_accepts_async_callback(tmp_path):
         events.append((event.row_id, event.status))
 
     result = await dataotter.map(
-        data=pd.DataFrame({"id": ["1", "2"], "text": ["ok", "bad"]}),
+        data=[{"id": "1", "text": "ok"}, {"id": "2", "text": "bad"}],
         row_id="id",
-        step_name="async_events",
+        name="async_events",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=dataotter.Engine(store=dataotter.JsonlStore(tmp_path)),
+        store=dataotter.JsonlStore(tmp_path),
         errors="return",
         max_failures=None,
         on_row_complete=on_row_complete,
@@ -419,22 +329,14 @@ async def test_on_row_complete_accepts_async_callback(tmp_path):
 
 
 async def test_jsonl_store_compacts_on_begin_run(tmp_path):
-    store = dataotter.JsonlStore(tmp_path, compact_min_records=1, compact_ratio=1.1)
-    engine = dataotter.Engine(store=store)
-    map_id = engine.derive_map_id(
-        step_name="compact",
-        version="1",
-        input_args=["text"],
-        outputs={"value": "value"},
-        config={},
+    store = dataotter.JsonlStore(
+        tmp_path,
+        compact_min_records=1,
+        compact_ratio=1.1,
     )
     store_run, _ = await store.begin_run(
-        map_id=map_id,
-        step_name="compact",
-        version="1",
+        name="compact",
         row_id_column="id",
-        inputs={"text": "text"},
-        outputs={"value": "value"},
         config={},
     )
     for value in ["a", "b", "c"]:
@@ -442,9 +344,7 @@ async def test_jsonl_store_compacts_on_begin_run(tmp_path):
             {
                 "type": "row_result",
                 "run_id": "run",
-                "map_id": map_id,
-                "step_name": "compact",
-                "version": "1",
+                "name": "compact",
                 "row_id": "1",
                 "input_hash": "sha256:abc",
                 "status": "success",
@@ -455,12 +355,8 @@ async def test_jsonl_store_compacts_on_begin_run(tmp_path):
     await store_run.finish()
 
     second_run, _ = await store.begin_run(
-        map_id=map_id,
-        step_name="compact",
-        version="1",
+        name="compact",
         row_id_column="id",
-        inputs={"text": "text"},
-        outputs={"value": "value"},
         config={},
     )
     await second_run.finish()
@@ -473,30 +369,16 @@ async def test_jsonl_store_compacts_on_begin_run(tmp_path):
 
 async def test_jsonl_store_ignores_incomplete_trailing_lines(tmp_path):
     store = dataotter.JsonlStore(tmp_path)
-    engine = dataotter.Engine(store=store)
-    map_id = engine.derive_map_id(
-        step_name="recovery",
-        version="1",
-        input_args=["text"],
-        outputs={"value": "value"},
-        config={},
-    )
     store_run, _ = await store.begin_run(
-        map_id=map_id,
-        step_name="recovery",
-        version="1",
+        name="recovery",
         row_id_column="id",
-        inputs={"text": "text"},
-        outputs={"value": "value"},
         config={},
     )
     await store_run.append_row_result(
         {
             "type": "row_result",
             "run_id": "run",
-            "map_id": map_id,
-            "step_name": "recovery",
-            "version": "1",
+            "name": "recovery",
             "row_id": "1",
             "input_hash": "sha256:ok",
             "status": "success",
@@ -509,171 +391,146 @@ async def test_jsonl_store_ignores_incomplete_trailing_lines(tmp_path):
     with results_path.open("a", encoding="utf-8") as handle:
         handle.write('{"type":"row_result",')
 
-    states = await store.load_states(step_name="recovery", version="1", map_id=map_id)
+    states = await store.load_states(name="recovery")
 
     assert list(states) == ['"1"']
     assert states['"1"'].outputs == {"value": "ok"}
 
 
-async def test_invalid_rows_bindings_and_functions(tmp_path):
-    df = pd.DataFrame({"id": ["1", "1"], "text": ["a", "b"]})
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
+async def test_invalid_rows_names_and_functions(tmp_path):
+    store = dataotter.JsonlStore(tmp_path)
 
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         return {"value": text}
 
     with pytest.raises(dataotter.InvalidRowIdError):
         await dataotter.map(
-            data=df,
+            data=[{"id": "1", "text": "a"}, {"id": "1", "text": "b"}],
             row_id="id",
-            step_name="bad_rows",
+            name="bad_rows",
             fn=fn,
-            inputs=["text"],
-            outputs=["value"],
-            engine=engine,
+            store=store,
         )
 
-    with pytest.raises(dataotter.InvalidBindingError):
-        await dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
-            row_id="id",
-            step_name="bad_outputs",
-            fn=fn,
-            inputs=["text"],
-            outputs={"value": "id"},
-            engine=engine,
-        )
-
-    def sync_fn(text: str) -> dict[str, object]:
+    def sync_fn(id: str, text: str) -> dict[str, object]:
         return {"value": text}
 
     with pytest.raises(dataotter.InvalidFunctionError):
         await dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+            data=[{"id": "1", "text": "a"}],
             row_id="id",
-            step_name="bad_fn",
+            name="bad_fn",
             fn=sync_fn,
-            inputs=["text"],
-            outputs=["value"],
-            engine=engine,
+            store=store,
         )
 
     with pytest.raises(dataotter.InvalidRowIdError):
         await dataotter.map(
-            data=pd.DataFrame({"id": [1], "text": ["a"]}),
+            data=[{"id": 1, "text": "a"}],
             row_id="id",
-            step_name="bad_row_type",
+            name="bad_row_type",
             fn=fn,
-            inputs=["text"],
-            outputs=["value"],
-            engine=engine,
+            store=store,
+        )
+
+    with pytest.raises(dataotter.InvalidRowIdError):
+        await dataotter.map(
+            data=[{"text": "a"}],
+            row_id="id",
+            name="missing_row_id",
+            fn=fn,
+            store=store,
         )
 
     with pytest.raises(ValueError):
         await dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+            data=[{"id": "1", "text": "a"}],
             row_id="id",
-            step_name="../bad",
+            name="../bad",
             fn=fn,
-            inputs=["text"],
-            outputs=["value"],
-            engine=engine,
+            store=store,
         )
 
     with pytest.raises(ValueError):
         await dataotter.map(
-            data=pd.DataFrame({"id": [], "text": []}),
+            data=[],
             row_id="id",
-            step_name="empty",
+            name="empty",
             fn=fn,
-            inputs=["text"],
-            outputs=["value"],
-            engine=engine,
+            store=store,
         )
 
-    with pytest.raises(dataotter.InvalidBindingError):
+    with pytest.raises(TypeError):
         await dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "a": ["a"], "b": ["b"]}),
+            data=[{"id": "1", "text": "a", "": "bad"}],
             row_id="id",
-            step_name="duplicate_args",
+            name="bad_key",
             fn=fn,
-            inputs={"a": "text", "b": "text"},
-            outputs=["value"],
-            engine=engine,
-        )
-
-    with pytest.raises(dataotter.InvalidBindingError):
-        await dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
-            row_id="id",
-            step_name="missing_input",
-            fn=fn,
-            inputs=["missing"],
-            outputs=["value"],
-            engine=engine,
+            store=store,
         )
 
     with pytest.raises(dataotter.InvalidFunctionError):
         await dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+            data=[{"id": "1", "text": "a", "extra": "b"}],
             row_id="id",
-            step_name="missing_required_arg",
+            name="unexpected_arg",
             fn=fn,
-            inputs={"text": "other"},
-            outputs=["value"],
-            engine=engine,
+            store=store,
+        )
+
+    with pytest.raises(dataotter.InvalidFunctionError):
+        await dataotter.map(
+            data=[{"id": "1", "other": "a"}],
+            row_id="id",
+            name="missing_required_arg",
+            fn=fn,
+            store=store,
         )
 
     with pytest.raises(ValueError, match="max_failures must be >= 1"):
         await dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+            data=[{"id": "1", "text": "a"}],
             row_id="id",
-            step_name="bad_max_failures",
+            name="bad_max_failures",
             fn=fn,
-            inputs=["text"],
-            outputs=["value"],
-            engine=engine,
+            store=store,
             max_failures=0,
         )
 
 
-async def test_strict_output_validation_is_persisted_as_row_error(tmp_path):
-    async def fn(text: str) -> dict[str, object]:
-        return {"wrong": text}
+async def test_output_validation_is_persisted_as_row_error(tmp_path):
+    async def collides(id: str, text: str) -> dict[str, object]:
+        return {"id": "other"}
 
     result = await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+        data=[{"id": "1", "text": "a"}],
         row_id="id",
-        step_name="strict_outputs",
-        fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=dataotter.Engine(store=dataotter.JsonlStore(tmp_path)),
+        name="row_id_collision",
+        fn=collides,
+        store=dataotter.JsonlStore(tmp_path),
         errors="return",
     )
 
-    assert result.output.empty
-    assert result.errors["error_type"].tolist() == ["ValueError"]
+    assert result.output == []
+    assert [error["error_type"] for error in result.errors] == ["ValueError"]
     assert result.stats.failed_rows == 1
 
 
 async def test_non_dict_return_is_persisted_as_row_error(tmp_path):
-    async def fn(text: str) -> list[str]:
+    async def fn(id: str, text: str) -> list[str]:
         return [text]
 
     result = await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+        data=[{"id": "1", "text": "a"}],
         row_id="id",
-        step_name="non_dict_output",
+        name="non_dict_output",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=dataotter.Engine(store=dataotter.JsonlStore(tmp_path)),
+        store=dataotter.JsonlStore(tmp_path),
         errors="return",
     )
 
-    assert result.errors["error_type"].tolist() == ["TypeError"]
-    assert result.output.empty
+    assert [error["error_type"] for error in result.errors] == ["TypeError"]
+    assert result.output == []
 
 
 async def test_semi_fail_fast_bounds_started_rows(tmp_path):
@@ -681,30 +538,27 @@ async def test_semi_fail_fast_bounds_started_rows(tmp_path):
     max_active = 0
     attempted: list[int] = []
 
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         nonlocal active, max_active
-        row_id = int(text)
-        attempted.append(row_id)
+        row_number = int(text)
+        attempted.append(row_number)
         active += 1
         max_active = max(max_active, active)
         try:
-            if row_id == 0:
+            if row_number == 0:
                 await asyncio.sleep(0.01)
                 raise RuntimeError("stop")
             await asyncio.sleep(0.05)
-            return {"value": row_id}
+            return {"value": row_number}
         finally:
             active -= 1
 
-    df = pd.DataFrame({"id": [str(i) for i in range(8)], "text": [str(i) for i in range(8)]})
     result = await dataotter.map(
-        data=df,
+        data=[{"id": str(i), "text": str(i)} for i in range(8)],
         row_id="id",
-        step_name="fail_fast",
+        name="fail_fast",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=dataotter.Engine(store=dataotter.JsonlStore(tmp_path)),
+        store=dataotter.JsonlStore(tmp_path),
         concurrency=2,
         errors="return",
         max_failures=1,
@@ -718,17 +572,15 @@ async def test_semi_fail_fast_bounds_started_rows(tmp_path):
 
 
 async def test_max_failures_none_attempts_all_rows(tmp_path):
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         raise RuntimeError(text)
 
     result = await dataotter.map(
-        data=pd.DataFrame({"id": [str(i) for i in range(4)], "text": [str(i) for i in range(4)]}),
+        data=[{"id": str(i), "text": str(i)} for i in range(4)],
         row_id="id",
-        step_name="all_failures",
+        name="all_failures",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=dataotter.Engine(store=dataotter.JsonlStore(tmp_path)),
+        store=dataotter.JsonlStore(tmp_path),
         concurrency=2,
         errors="return",
         max_failures=None,
@@ -740,42 +592,41 @@ async def test_max_failures_none_attempts_all_rows(tmp_path):
 
 
 async def test_map_failed_error_contains_partial_result(tmp_path):
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         raise RuntimeError(text)
 
     with pytest.raises(dataotter.MapFailedError) as exc_info:
         await dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "text": ["boom"]}),
+            data=[{"id": "1", "text": "boom"}],
             row_id="id",
-            step_name="raises",
+            name="raises",
             fn=fn,
-            inputs=["text"],
-            outputs=["value"],
-            engine=dataotter.Engine(store=dataotter.JsonlStore(tmp_path)),
+            store=dataotter.JsonlStore(tmp_path),
         )
 
     assert exc_info.value.result.stats.failed_rows == 1
-    assert exc_info.value.result.errors["error_message"].tolist() == ["boom"]
+    assert [
+        error["error_message"]
+        for error in exc_info.value.result.errors
+    ] == ["boom"]
 
 
 async def test_cancellation_drains_in_flight_rows_and_reraises(tmp_path):
     started = asyncio.Event()
 
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         started.set()
         await asyncio.sleep(0.02)
         return {"value": text}
 
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
+    store = dataotter.JsonlStore(tmp_path)
     task = asyncio.create_task(
         dataotter.map(
-            data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+            data=[{"id": "1", "text": "a"}],
             row_id="id",
-            step_name="cancel",
+            name="cancel",
             fn=fn,
-            inputs=["text"],
-            outputs=["value"],
-            engine=engine,
+            store=store,
         )
     )
     await started.wait()
@@ -783,66 +634,60 @@ async def test_cancellation_drains_in_flight_rows_and_reraises(tmp_path):
     with pytest.raises(asyncio.CancelledError):
         await task
     retry = await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+        data=[{"id": "1", "text": "a"}],
         row_id="id",
-        step_name="cancel",
+        name="cancel",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        store=store,
     )
     assert retry.stats.reused_rows == 1
 
 
 async def test_delete_maps(tmp_path):
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         return {"value": text}
 
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
+    store = dataotter.JsonlStore(tmp_path)
     result = await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+        data=[{"id": "1", "text": "a"}],
         row_id="id",
-        step_name="delete_me",
+        name="delete_me",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        store=store,
     )
 
-    assert engine.get_map(result.map_id)["step_name"] == "delete_me"
-    assert engine.delete_map(result.map_id) is True
-    assert engine.delete_map(result.map_id) is False
+    assert store.get_map(result.name)["name"] == "delete_me"
+    assert store.delete_map(result.name) is True
+    assert store.delete_map(result.name) is False
 
     await dataotter.map(
-        data=pd.DataFrame({"id": ["1"], "text": ["a"]}),
+        data=[{"id": "1", "text": "a"}],
         row_id="id",
-        step_name="delete_family",
+        name="delete_family",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        store=store,
     )
-    assert engine.delete_maps(step_name="delete_family") == 1
+    assert store.delete_maps(name="delete_family") == 1
 
 
 async def test_results_jsonl_contains_one_record_per_attempted_row(tmp_path):
-    async def fn(text: str) -> dict[str, object]:
+    async def fn(id: str, text: str) -> dict[str, object]:
         return {"value": text}
 
-    engine = dataotter.Engine(store=dataotter.JsonlStore(tmp_path))
+    store = dataotter.JsonlStore(tmp_path)
     result = await dataotter.map(
-        data=pd.DataFrame({"id": ["1", "2"], "text": ["a", "b"]}),
+        data=[{"id": "1", "text": "a"}, {"id": "2", "text": "b"}],
         row_id="id",
-        step_name="jsonl_records",
+        name="jsonl_records",
         fn=fn,
-        inputs=["text"],
-        outputs=["value"],
-        engine=engine,
+        store=store,
     )
 
     records = [
         json.loads(line)
-        for line in next(tmp_path.rglob("results.jsonl")).read_text().splitlines()
+        for line in next(
+            tmp_path.rglob("results.jsonl")
+        ).read_text().splitlines()
     ]
     assert [record["row_id"] for record in records] == ["1", "2"]
-    assert {record["map_id"] for record in records} == {result.map_id}
+    assert {record["name"] for record in records} == {result.name}

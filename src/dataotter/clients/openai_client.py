@@ -2,14 +2,21 @@ import asyncio
 from collections.abc import Callable, Mapping
 from typing import Any, Self
 
-from openai import APIConnectionError, APITimeoutError, AsyncOpenAI, RateLimitError
+from openai import (
+    APIConnectionError,
+    APITimeoutError,
+    AsyncOpenAI,
+    RateLimitError,
+)
 
 # Global rate limiter for OpenAI API requests
 _DEFAULT_MAX_OPENAI_REQUESTS = 10
 _OPENAI_RATE_LIMITER: asyncio.Semaphore | None = None
 
 
-def get_openai_rate_limiter(max_requests: int | None = None) -> asyncio.Semaphore:
+def get_openai_rate_limiter(
+    max_requests: int | None = None,
+) -> asyncio.Semaphore:
     """Get or create the global OpenAI rate limiter semaphore.
 
     Args:
@@ -20,7 +27,11 @@ def get_openai_rate_limiter(max_requests: int | None = None) -> asyncio.Semaphor
     """
     global _OPENAI_RATE_LIMITER
     if _OPENAI_RATE_LIMITER is None:
-        limit = max_requests if max_requests is not None else _DEFAULT_MAX_OPENAI_REQUESTS
+        limit = (
+            max_requests
+            if max_requests is not None
+            else _DEFAULT_MAX_OPENAI_REQUESTS
+        )
         if limit <= 0:
             raise ValueError("max_requests must be > 0")
         _OPENAI_RATE_LIMITER = asyncio.Semaphore(limit)
@@ -47,9 +58,9 @@ class OpenAIClient:
     """
     Thin async wrapper over `openai.AsyncOpenAI` with retry/throttle helpers.
 
-    All OpenAI API requests are rate-limited by a global semaphore (default: 10 concurrent
-    requests). This ensures multiple clients and workflows coordinate to respect OpenAI's
-    rate limits.
+    All OpenAI API requests are rate-limited by a global semaphore
+    (default: 10 concurrent requests). This ensures multiple clients
+    and workflows coordinate to respect OpenAI's rate limits.
 
     Request kwargs are passed directly to the OpenAI SDK methods.
     Raw SDK responses are returned unchanged.
@@ -144,7 +155,11 @@ class OpenAIClient:
             try:
                 async with self._rate_limiter:
                     return await func(**kwargs)
-            except (APITimeoutError, APIConnectionError, RateLimitError) as exc:
+            except (
+                APITimeoutError,
+                APIConnectionError,
+                RateLimitError,
+            ) as exc:
                 if attempt >= self.max_retries:
                     raise
                 delay = self._compute_retry_delay(exc, attempt)
