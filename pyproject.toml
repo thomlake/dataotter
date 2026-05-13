@@ -1,12 +1,11 @@
 [project]
 name = "dataotter"
 version = "0.1.0"
-description = "Resumable async row-wise workflows over pandas DataFrames"
+description = "Local persistence for async maps"
 readme = "README.md"
 requires-python = ">=3.12"
 dependencies = [
     "openai>=2.36.0",
-    "pandas>=2.0",
 ]
 
 [dependency-groups]

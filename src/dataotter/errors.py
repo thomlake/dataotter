@@ -1,8 +1,6 @@
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
-    import pandas as pd
-
     from dataotter.types import MapResult
 
 
@@ -11,9 +9,17 @@ class DataOtterError(Exception):
 
 
 class CacheMismatchError(DataOtterError):
-    def __init__(self, mismatches: pd.DataFrame) -> None:
+    def __init__(self, mismatches: list[dict[str, object]]) -> None:
         super().__init__("Cached row inputs do not match the current data")
         self.mismatches = mismatches
+
+
+class ConfigMismatchError(DataOtterError):
+    def __init__(self, *, name: str) -> None:
+        super().__init__(
+            f"Cached map {name!r} was created with a different config"
+        )
+        self.name = name
 
 
 class MapFailedError(DataOtterError):
@@ -25,10 +31,6 @@ class MapFailedError(DataOtterError):
 
 class InvalidFunctionError(DataOtterError):
     """Raised when the provided function cannot be called by dataotter."""
-
-
-class InvalidBindingError(DataOtterError):
-    """Raised when input or output bindings are invalid."""
 
 
 class InvalidRowIdError(DataOtterError):

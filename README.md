@@ -1,14 +1,15 @@
 # dataotter
 
-`dataotter` runs resumable async row-wise workflows over pandas DataFrames.
+`dataotter` provides local persistence for async maps over records.
 
-It is useful when each row calls something slow or failure-prone, such as an
+It is useful when each record calls something slow or failure-prone, such as an
 LLM API, classifier, parser, scraper, or enrichment service. Successful rows are
 persisted as they complete, so reruns reuse prior successes and retry only
 missing or failed rows.
 
-`dataotter` is not a DAG orchestrator and is not a pandas replacement. Use
-pandas for filtering, joining, sequencing, and merging intermediate results.
+`dataotter` is not a DAG orchestrator or a DataFrame library. Prepare, filter,
+join, and merge your data outside `dataotter`; pass records in as plain
+`list[dict[str, Any]]`.
 
 ## Install
 
@@ -22,62 +23,63 @@ uv sync
 
 ```python
 import dataotter
-import pandas as pd
 
 
-df = pd.DataFrame(
-    {
-        "doc_id": ["1", "2", "3"],
-        "body_text": ["a job post", "a recipe", "another job post"],
-    }
-)
+records = [
+    {"doc_id": "1", "body_text": "a job post"},
+    {"doc_id": "2", "body_text": "a recipe"},
+    {"doc_id": "3", "body_text": "another job post"},
+]
 
-engine = dataotter.Engine()
+store = dataotter.JsonlStore()
 
 
-async def classify(text: str) -> dict[str, object]:
+async def classify(doc_id: str, body_text: str) -> dict[str, object]:
     # Call any async service here.
     return {
-        "label": "job" if "job" in text else "other",
+        "label": "job" if "job" in body_text else "other",
         "confidence": 0.9,
     }
 
 
 result = await dataotter.map(
-    data=df,
+    data=records,
     row_id="doc_id",
-    step_name="classify_document",
+    name="classify_document-v1",
     fn=classify,
-    inputs={"body_text": "text"},
-    outputs={
-        "label": "classification_label",
-        "confidence": "classification_confidence",
-    },
-    config={"classifier_version": "v1"},
-    engine=engine,
+    config={"prompt_hash": "sha256:..."},
+    store=store,
     concurrency=10,
 )
-
-df = df.merge(result.output, on="doc_id", how="left")
 ```
 
-`result.output` contains only the row ID column and declared output columns.
-Merge it back into your own DataFrame explicitly.
+`result.output` contains successful rows as plain dictionaries:
+
+```python
+[
+    {"doc_id": "1", "label": "job", "confidence": 0.9},
+    {"doc_id": "2", "label": "other", "confidence": 0.9},
+    {"doc_id": "3", "label": "job", "confidence": 0.9},
+]
+```
+
+If your data starts in pandas, convert it before calling `map`:
+
+```python
+records = df.to_dict(orient="records")
+```
 
 ## API
 
 ```python
 await dataotter.map(
     *,
-    data: pd.DataFrame,
+    data: list[dict[str, Any]],
     row_id: str,
-    step_name: str,
+    name: str,
     fn: Callable[..., Awaitable[dict[str, Any]]],
-    inputs: list[str] | dict[str, str],
-    outputs: list[str] | dict[str, str],
     config: dict[str, Any] | None = None,
-    engine: dataotter.Engine | None = None,
-    version: str = "1",
+    store: dataotter.Store | None = None,
     concurrency: int = 10,
     errors: Literal["raise_after", "return"] = "raise_after",
     max_failures: int | None = 10,
@@ -87,64 +89,34 @@ await dataotter.map(
 
 Important rules:
 
-- `row_id` is required, must name an existing column, and all row ID values must be unique non-null strings.
+- `data` must be a non-empty list of dict records.
+- `row_id` is required, must name an existing key, and all row ID values must be unique non-null strings.
+- `name` is the cache identity and may contain letters, numbers, dots, underscores, and hyphens.
 - `fn` must be async and must return a `dict`.
-- `inputs` maps DataFrame columns to function keyword arguments.
-- `outputs` maps returned dict keys to output DataFrame columns.
-- Returned keys must exactly match declared output keys.
-- Output columns may not include the row ID column.
-
-List shorthand is supported:
-
-```python
-inputs=["text"]
-outputs=["label"]
-```
-
-is equivalent to:
-
-```python
-inputs={"text": "text"}
-outputs={"label": "label"}
-```
+- `dataotter` calls `fn` with expanded keyword arguments from each normalized record.
+- Returned keys are persisted as output keys.
+- Returned keys may not include the `row_id` key.
 
 ## Cache Identity
 
-`dataotter` caches row outcomes under a derived `map_id`.
+`name` identifies a persisted map. Use whatever naming convention fits your
+workflow, for example `name=f"{step_name}-{version}"`.
 
-The `map_id` is based on:
-
-- `step_name`
-- `version`
-- function input argument names
-- output bindings
-- normalized `config`
+Map-level validation is based on `config`. Reusing a `name` with a different
+normalized config raises `ConfigMismatchError` before row work starts.
 
 Row-level reuse is based on:
 
-- same `map_id`
+- same `name`
 - same row ID value
-- same normalized kwargs passed to `fn`
+- same normalized full record hash
 
-Source DataFrame column names are adapter details. Renaming `body_text` to
-`raw_text` does not invalidate cache state if both invocations call
-`fn(text=...)` with the same value for the same row ID.
-
-`dataotter` does not hash Python function code. Use `version` or `config` to
-record changes that affect correctness:
-
-```python
-result = await dataotter.map(
-    ...,
-    step_name="extract_fields",
-    version="2",
-    config={"prompt_hash": "sha256:..."},
-)
-```
-
-If a row already has cached state for the same `map_id` and row ID, but the
-current kwargs hash differs, `dataotter` raises `CacheMismatchError` before
+If a row already has cached state for the same `name` and row ID, but the
+current full record hash differs, `dataotter` raises `CacheMismatchError` before
 starting new work.
+
+`dataotter` does not hash Python function code. Put prompt hashes, model names,
+or other correctness-affecting settings in `config`, or include them in `name`.
 
 ## Failure Behavior
 
@@ -197,11 +169,11 @@ The callback may be sync or async.
 
 `MapResult` contains:
 
-- `output`: DataFrame with `row_id + declared output columns`.
-- `errors`: DataFrame with failed row details.
+- `output`: list of successful row dicts with `row_id` plus returned keys.
+- `errors`: list of failed row details.
 - `stats`: row counts and timing fields.
 - `run_id`: unique ID for the current run.
-- `map_id`: derived cache identity.
+- `name`: cache identity.
 
 `MapStats` includes:
 
@@ -220,22 +192,22 @@ The callback may be sync or async.
 ## Cache Management
 
 ```python
-engine = dataotter.Engine()
+store = dataotter.JsonlStore()
 
-maps = engine.list_maps()
-manifest = engine.get_map(result.map_id)
+maps = store.list_maps()
+manifest = store.get_map(result.name)
 
-engine.delete_map(result.map_id)
-engine.delete_maps(step_name="classify_document")
+store.delete_map(result.name)
+store.delete_maps(name="classify_document-v1")
 ```
 
 The default store is a local JSONL store rooted at `.dataotter/` in the current
 working directory. It is safe within a single async process, but it is not
-intended for cross-process coordination. Pass a custom store (or a `JsonlStore`
-with a different path) via:
+intended for cross-process coordination. Pass a custom store or path via:
 
 ```python
-engine = dataotter.Engine(store=dataotter.JsonlStore("/path/to/cache"))
+store = dataotter.JsonlStore("/path/to/cache")
+result = await dataotter.map(..., store=store)
 ```
 
 ## Development

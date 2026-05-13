@@ -1,8 +1,7 @@
-from dataotter.engine import Engine
 from dataotter.errors import (
     CacheMismatchError,
+    ConfigMismatchError,
     DataOtterError,
-    InvalidBindingError,
     InvalidFunctionError,
     InvalidRowIdError,
     MapFailedError,
@@ -13,9 +12,8 @@ from dataotter.types import MapResult, MapStats, RowEvent
 
 __all__ = [
     "CacheMismatchError",
+    "ConfigMismatchError",
     "DataOtterError",
-    "Engine",
-    "InvalidBindingError",
     "InvalidFunctionError",
     "InvalidRowIdError",
     "JsonlStore",
