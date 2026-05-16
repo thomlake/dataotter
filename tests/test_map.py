@@ -611,12 +611,19 @@ async def test_map_failed_error_contains_partial_result(tmp_path):
     ] == ["boom"]
 
 
-async def test_cancellation_drains_in_flight_rows_and_reraises(tmp_path):
+async def test_cancellation_cancels_in_flight_rows_and_reraises(tmp_path):
     started = asyncio.Event()
+    cancelled = asyncio.Event()
 
     async def fn(id: str, text: str) -> dict[str, object]:
         started.set()
-        await asyncio.sleep(0.02)
+        if cancelled.is_set():
+            return {"value": text}
+        try:
+            await asyncio.sleep(60)
+        except asyncio.CancelledError:
+            cancelled.set()
+            raise
         return {"value": text}
 
     store = dataotter.JsonlStore(tmp_path)
@@ -632,7 +639,11 @@ async def test_cancellation_drains_in_flight_rows_and_reraises(tmp_path):
     await started.wait()
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
-        await task
+        await asyncio.wait_for(task, timeout=1)
+
+    assert cancelled.is_set()
+    assert await store.load_states(name="cancel") == {}
+
     retry = await dataotter.map(
         data=[{"id": "1", "text": "a"}],
         row_id="id",
@@ -640,7 +651,8 @@ async def test_cancellation_drains_in_flight_rows_and_reraises(tmp_path):
         fn=fn,
         store=store,
     )
-    assert retry.stats.reused_rows == 1
+    assert retry.stats.reused_rows == 0
+    assert retry.stats.attempted_rows == 1
 
 
 async def test_delete_maps(tmp_path):

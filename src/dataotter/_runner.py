@@ -223,12 +223,13 @@ async def run_map(
                 asyncio.create_task(worker())
                 for _ in range(worker_count)
             ]
-            gathered = asyncio.gather(*worker_tasks)
             try:
-                await asyncio.shield(gathered)
+                await asyncio.gather(*worker_tasks)
             except (asyncio.CancelledError, KeyboardInterrupt):
                 stop_event.set()
-                await gathered
+                for task in worker_tasks:
+                    task.cancel()
+                await asyncio.gather(*worker_tasks, return_exceptions=True)
                 raise
 
         result = _build_result(
